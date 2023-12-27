@@ -19,6 +19,8 @@ struct {
 	};
 	// CardAnimationManager::Update
 	std::string_view CAMUpdate = "\x48\x8B\xC4\x48\x89\x58\x20\xF3\x0F\x11\x48\x10"sv;
+	// Timekeeping::Check30FPS
+	std::string_view Check30FPS = "\x8B\x15\x2A\x2A\x06\x00\x48\x8B\x0D\x2A\x2A\x06\x00\x44\x8B\x0D\x2A\x2A\x06\x00\x85\xD2"sv;
 } sigs;
 
 typedef bool(*InitializeTimekeeping)(void* _this);
@@ -28,14 +30,27 @@ u64 baseAddr = 0;
 u64 initTimekeepingAddr = 0;
 
 // corresponds to mov cs:g_ThirtyFPSTicks, rdx in Timekeeping::InitializeTimekeeping
-u64 firstOffset = 0x9F;
-// corresponds to mov r11, qword ptr cs:g_PerfFreq in Timekeeping::InitializeTimekeeping
-u64 secondOffset = 0x73;
 u64 potentialFirstOffsets[] = { 0x9F, 0x84 };
+// corresponds to mov r11, qword ptr cs:g_PerfFreq in Timekeeping::InitializeTimekeeping
 u64 potentialSecondOffsets[] = { 0x73, 0x58 };
+u64 firstOffset = potentialFirstOffsets[0];
+u64 secondOffset = potentialSecondOffsets[0];
+
+LARGE_INTEGER* g_NewTime = nullptr;
+LARGE_INTEGER* g_LastTime = nullptr;
 
 InitializeTimekeeping orig_InitializeTimekeeping = nullptr;
 OnClockTick orig_CAMUpdate = nullptr;
+
+int verifyInstructions(u8* instructions, u8* expected, int expectedSize) {
+	for (int i = 0; i < expectedSize; i++) {
+		if (instructions[i] != expected[i]) {
+			return i;
+		}
+	}
+
+	return 0;
+}
 
 bool hooked_InitializeTimekeeping(void* _this) {
 	bool ret = orig_InitializeTimekeeping(_this);
@@ -43,13 +58,13 @@ bool hooked_InitializeTimekeeping(void* _this) {
 	// need g_ThirtyFPSTicks
 	u8* instructions = (u8*)(initTimekeepingAddr + firstOffset);
 	u8 expectedInstructions[] = { 0x48, 0x89, 0x15 };
+	int mismatch = verifyInstructions(instructions, expectedInstructions, sizeof(expectedInstructions));
 
-	for (int i = 0; i < sizeof(expectedInstructions); i++) {
-		if (instructions[i] != expectedInstructions[i]) {
-			printf("[WARNING] Unexpected instructions at Timekeeping::InitializeTimekeeping+%llX (expected 0x%X, actual was 0x%X)\n", firstOffset + i, expectedInstructions[i], instructions[i]);
-			printf("[WARNING] Unable to apply FPS patch!\n");
-			return ret;
-		}
+	if (mismatch) {
+		wchar_t msg[256];
+		wsprintf(msg, L"Unexpected instructions at Timekeeping::InitializeTimekeeping+%llX (expected 0x%X, actual was 0x%X)\n\nUnable to apply FPS patch!", firstOffset + mismatch, expectedInstructions[mismatch], instructions[mismatch]);
+		MessageBox(nullptr, msg, L"Win7CardGames60FPS", MB_ICONERROR | MB_OK);
+		return ret;
 	}
 
 	u64 relAddr = *(u32*)(initTimekeepingAddr + firstOffset + 3);
@@ -60,13 +75,13 @@ bool hooked_InitializeTimekeeping(void* _this) {
 	expectedInstructions[0] = 0x4C;
 	expectedInstructions[1] = 0x8B;
 	expectedInstructions[2] = 0x1D;
+	mismatch = verifyInstructions(instructions, expectedInstructions, sizeof(expectedInstructions));
 
-	for (int i = 0; i < sizeof(expectedInstructions); i++) {
-		if (instructions[i] != expectedInstructions[i]) {
-			printf("[WARNING] Unexpected instructions at Timekeeping::InitializeTimekeeping+%llX (expected 0x%X, actual was 0x%X)\n", secondOffset + i, expectedInstructions[i], instructions[i]);
-			printf("[WARNING] Unable to apply FPS patch!\n");
-			return ret;
-		}
+	if (mismatch) {
+		wchar_t msg[256];
+		wsprintf(msg, L"Unexpected instructions at Timekeeping::InitializeTimekeeping+%llX (expected 0x%X, actual was 0x%X)\n\nUnable to apply FPS patch!", secondOffset + mismatch, expectedInstructions[mismatch], instructions[mismatch]);
+		MessageBox(nullptr, msg, L"Win7CardGames60FPS", MB_ICONERROR | MB_OK);
+		return ret;
 	}
 
 	relAddr = *(u32*)(initTimekeepingAddr + secondOffset + 3);
@@ -82,6 +97,20 @@ void hooked_CAMUpdate(void* _this, float a2) {
 	orig_CAMUpdate(_this, 1.0f / targetUpdateRate);
 }
 
+bool hooked_Check30FPS(void* _this) {
+	// TODO: this assumes that the current timekeeping method uses getCurTime
+	if (g_NewTime->LowPart - g_LastTime->LowPart > 1000 / GetPrivateProfileInt(L"Config", L"FPS", 60, L".\\config.ini")) {
+		if (g_NewTime->LowPart - g_LastTime->LowPart <= 2000) {
+			g_LastTime->LowPart += 1000 / GetPrivateProfileInt(L"Config", L"FPS", 60, L".\\config.ini");
+		} else {
+			g_LastTime->LowPart = g_NewTime->LowPart;
+		}
+		return true;
+	} else {
+		return false;
+	}
+}
+
 extern "C" __declspec(dllexport) HRESULT WINAPI SLGetWindowsInformationDWORD(_In_ PCWSTR pwszValueName, _Out_ DWORD * pdwValue) {
 	printf("checking %ls\n", pwszValueName);
 	pdwValue[0] = 1;
@@ -89,10 +118,13 @@ extern "C" __declspec(dllexport) HRESULT WINAPI SLGetWindowsInformationDWORD(_In
 	printf("addr of game: 0x%llX\n", baseAddr);
 	// printf("g_uiConsoleMask? 0x%llX\n", baseAddr + 0xBB334);
 	// printf("Enabling debug logs...\n");
-	//u32* g_uiConsoleMask = (u32*)(baseAddr + 0xBB334);
+	//u32* g_uiConsoleMask = (u32*)(baseAddr + 0xB9320);
 	//*g_uiConsoleMask = 0xFFFFFFFF;
+	//*g_uiConsoleMask = 0x8;
 	printf("Hooking Timekeeping::InitializeTimekeeping...\n");
 	MakeHook(nullptr, sigs.CAMUpdate, hooked_CAMUpdate, (void**)&orig_CAMUpdate);
+
+	bool hookSucceeded = false;
 
 	for (int i = 0; i < 2; i++) {
 		printf("Trying %i\n", i);
@@ -101,9 +133,54 @@ extern "C" __declspec(dllexport) HRESULT WINAPI SLGetWindowsInformationDWORD(_In
 		firstOffset = potentialFirstOffsets[i];
 		secondOffset = potentialSecondOffsets[i];
 		MakeHook(nullptr, sigs.InitializeTimekeeping[i], hooked_InitializeTimekeeping, (void**)&orig_InitializeTimekeeping);
+		hookSucceeded = true;
 		printf("Success!\n");
 		break;
 	}
+
+	printf("InitializeTimekeeping hook failed, trying to hook Check30FPS instead\n");
+
+	if (!hookSucceeded) {
+		// if all of the hook attempts failed, we're probably on the Vista versions, which are slightly different wrt timekeeping
+		u64 addr_Check30FPS = FindSig(nullptr, sigs.Check30FPS);
+		if (addr_Check30FPS) {
+			u8* instructions = (u8*)(addr_Check30FPS + 6);
+			u8 expectedInstructions[] = { 0x48, 0x8B, 0x0D };
+			int mismatch = verifyInstructions(instructions, expectedInstructions, sizeof(expectedInstructions));
+			if (mismatch) {
+				wchar_t msg[256];
+				wsprintf(msg, L"Unexpected instructions at Timekeeping::Check30FPS+%llX (expected 0x%X, actual was 0x%X)\n\nUnable to apply FPS patch!", addr_Check30FPS + 6 + mismatch, expectedInstructions[mismatch], instructions[mismatch]);
+				MessageBox(nullptr, msg, L"Win7CardGames60FPS", MB_ICONERROR | MB_OK);
+				return S_OK;
+			}
+			u64 relAddr = *(u32*)(addr_Check30FPS + 6 + 3);
+			g_NewTime = (LARGE_INTEGER*)(relAddr + addr_Check30FPS + 6 + 3 + 4);
+			instructions = (u8*)(addr_Check30FPS + 0x0D);
+			expectedInstructions[0] = 0x44;
+			mismatch = verifyInstructions(instructions, expectedInstructions, sizeof(expectedInstructions));
+
+			if (mismatch) {
+				if (mismatch) {
+					wchar_t msg[256];
+					wsprintf(msg, L"Unexpected instructions at Timekeeping::Check30FPS+%llX (expected 0x%X, actual was 0x%X)\n\nUnable to apply FPS patch!", addr_Check30FPS + 0xD + mismatch, expectedInstructions[mismatch], instructions[mismatch]);
+					MessageBox(nullptr, msg, L"Win7CardGames60FPS", MB_ICONERROR | MB_OK);
+					return S_OK;
+				}
+			}
+
+			relAddr = *(u32*)(addr_Check30FPS + 0x0D + 3);
+			g_LastTime = (LARGE_INTEGER*)(relAddr + addr_Check30FPS + 0x0D + 3 + 4);
+
+			MakeHook(nullptr, sigs.Check30FPS, hooked_Check30FPS);
+			hookSucceeded = true;
+			printf("Success!\n");
+		}
+	}
+
+	if (!hookSucceeded) {
+		MessageBox(nullptr, L"Failed to find signatures necessary for the FPS patch.", L"Win7CardGames60FPS", MB_ICONERROR | MB_OK);
+	}
+
 	return S_OK;
 }
 

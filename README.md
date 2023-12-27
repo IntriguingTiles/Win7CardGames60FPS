@@ -1,5 +1,5 @@
 # Win7CardGames60FPS
-This is a hack for the built-in Windows 7 card games that allows for arbitrary framerates and update rates.
+This is a hack for the built-in Windows 7 (and Vista) card games that allows for arbitrary framerates and update rates.
 
 It's not perfect, I think there might be some frame pacing issues that cause the games to feel choppy at times, but it's better than being stuck at 30 FPS.
 
