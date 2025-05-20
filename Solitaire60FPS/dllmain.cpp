@@ -21,10 +21,18 @@ struct {
 	std::string_view CAMUpdate = "\x48\x8B\xC4\x48\x89\x58\x20\xF3\x0F\x11\x48\x10"sv;
 	// Timekeeping::Check30FPS
 	std::string_view Check30FPS = "\x8B\x15\x2A\x2A\x06\x00\x48\x8B\x0D\x2A\x2A\x06\x00\x44\x8B\x0D\x2A\x2A\x06\x00\x85\xD2"sv;
+	// FreeCellGame::Update
+	std::string_view FreeCellGameUpdate = "\x48\x8B\xC4\x41\x54\x48\x83\xEC\x50\x48\xC7\x44\x24\x20\xFE\xFF\xFF\xFF"sv;
+	// SolitaireGame::OnRunState
+	std::string_view SolitaireGameORS = "\x48\x8B\xC4\x57\x41\x54\x41\x55\x41\x56\x41\x57\x48\x83\xEC\x40\x48\xC7\x44\x24\x20\xFE\xFF\xFF\xFF\x48\x89\x58\x08\x48\x89\x68\x10\x48\x89\x70\x18\x8B\xF2"sv;
+	// SpiderGame::OnRunState
+	std::string_view SpiderGameORS = "\x48\x89\x5C\x24\x08\x48\x89\x6C\x24\x10\x57"sv;
 } sigs;
 
 typedef bool(*InitializeTimekeeping)(void* _this);
 typedef void(*OnClockTick)(void* _this, float a2);
+typedef bool(*FreeCellGameUpdate)(void* _this, float a2);
+typedef int(*OnRunState)(void* _this, int a2, int a3);
 
 u64 baseAddr = 0;
 u64 initTimekeepingAddr = 0;
@@ -39,8 +47,17 @@ u64 secondOffset = potentialSecondOffsets[0];
 LARGE_INTEGER* g_NewTime = nullptr;
 LARGE_INTEGER* g_LastTime = nullptr;
 
+// used for keeping state updates at 30 FPS
+LARGE_INTEGER g_MyPerfFreq;
+s64 g_MyThirtyFPSTicks;
+LARGE_INTEGER g_MyNewTime;
+LARGE_INTEGER g_MyLastTime;
+int g_LastORSRet = 0;
+
 InitializeTimekeeping orig_InitializeTimekeeping = nullptr;
 OnClockTick orig_CAMUpdate = nullptr;
+FreeCellGameUpdate orig_FreeCellGameUpdate = nullptr;
+OnRunState orig_OnRunState = nullptr;
 
 int verifyInstructions(u8* instructions, u8* expected, int expectedSize) {
 	for (int i = 0; i < expectedSize; i++) {
@@ -111,16 +128,62 @@ bool hooked_Check30FPS(void* _this) {
 	}
 }
 
-extern "C" __declspec(dllexport) HRESULT WINAPI SLGetWindowsInformationDWORD(_In_ PCWSTR pwszValueName, _Out_ DWORD * pdwValue) {
+bool hooked_FreeCellGameUpdate(void* _this, float a2) {
+	int targetUpdateRate = GetPrivateProfileInt(L"Config", L"UPS", 60, L".\\config.ini");
+	return orig_FreeCellGameUpdate(_this, 1.0f / targetUpdateRate);
+}
+
+void initStateTimekeeping() {
+	QueryPerformanceFrequency(&g_MyPerfFreq);
+	QueryPerformanceCounter(&g_MyLastTime);
+	g_MyThirtyFPSTicks = g_MyPerfFreq.QuadPart / 30;
+}
+
+void updateStateTimekeeping() {
+	QueryPerformanceCounter(&g_MyNewTime);
+	if (g_MyLastTime.QuadPart > g_MyNewTime.QuadPart)
+	{
+		g_MyNewTime = g_MyLastTime;
+	}
+}
+
+bool check30FPSStateTimekeeping() {
+	if (g_MyNewTime.QuadPart - g_MyLastTime.QuadPart > g_MyThirtyFPSTicks)
+	{
+		if (g_MyNewTime.QuadPart - g_MyLastTime.QuadPart <= 2 * g_MyPerfFreq.QuadPart)
+			g_MyLastTime.QuadPart += g_MyThirtyFPSTicks;
+		else
+			g_MyLastTime = g_MyNewTime;
+		return true;
+	}
+
+	return false;
+}
+
+int hooked_OnRunState(void* _this, int a2, int a3) {
+	updateStateTimekeeping();
+
+	if (check30FPSStateTimekeeping()) {
+		g_LastORSRet = orig_OnRunState(_this, a2, a3);
+		return g_LastORSRet;
+	}
+
+	// just return that last value that we got from OnRunState while we wait
+	return g_LastORSRet;
+}
+
+extern "C" __declspec(dllexport) HRESULT WINAPI SLGetWindowsInformationDWORD(_In_ PCWSTR pwszValueName, _Out_ DWORD* pdwValue) {
 	printf("checking %ls\n", pwszValueName);
 	pdwValue[0] = 1;
 	baseAddr = (u64)GetModuleHandle(nullptr);
 	printf("addr of game: 0x%llX\n", baseAddr);
-	// printf("g_uiConsoleMask? 0x%llX\n", baseAddr + 0xBB334);
-	// printf("Enabling debug logs...\n");
-	//u32* g_uiConsoleMask = (u32*)(baseAddr + 0xB9320);
+	//printf("g_uiConsoleMask? 0x%llX\n", baseAddr + 0xBB334);
+	//printf("Enabling debug logs...\n");
+	//u32* g_uiConsoleMask = (u32*)(baseAddr + 0xBB334);
 	//*g_uiConsoleMask = 0xFFFFFFFF;
 	//*g_uiConsoleMask = 0x8;
+	//bool* g_bDebugEnabled = (bool*)(baseAddr + 0xBB124);
+	//*g_bDebugEnabled = true;
 	printf("Hooking Timekeeping::InitializeTimekeeping...\n");
 	MakeHook(nullptr, sigs.CAMUpdate, hooked_CAMUpdate, (void**)&orig_CAMUpdate);
 
@@ -138,9 +201,9 @@ extern "C" __declspec(dllexport) HRESULT WINAPI SLGetWindowsInformationDWORD(_In
 		break;
 	}
 
-	printf("InitializeTimekeeping hook failed, trying to hook Check30FPS instead\n");
-
 	if (!hookSucceeded) {
+		printf("InitializeTimekeeping hook failed, trying to hook Check30FPS instead\n");
+
 		// if all of the hook attempts failed, we're probably on the Vista versions, which are slightly different wrt timekeeping
 		u64 addr_Check30FPS = FindSig(nullptr, sigs.Check30FPS);
 		if (addr_Check30FPS) {
@@ -179,6 +242,21 @@ extern "C" __declspec(dllexport) HRESULT WINAPI SLGetWindowsInformationDWORD(_In
 
 	if (!hookSucceeded) {
 		MessageBox(nullptr, L"Failed to find signatures necessary for the FPS patch.", L"Win7CardGames60FPS", MB_ICONERROR | MB_OK);
+	}
+
+	// a side effect of the fps patch causes hints to show up much faster than normal
+	// unfortunately, there is no easy way to fix this universally
+
+	if (wcsstr(pwszValueName, L"-FreeCell-")) {
+		MakeHook(nullptr, sigs.FreeCellGameUpdate, hooked_FreeCellGameUpdate, (void**)&orig_FreeCellGameUpdate);
+	} else if (wcsstr(pwszValueName, L"-SpiderSolitaire-")) {
+		initStateTimekeeping();
+		g_LastORSRet = 9;
+		MakeHook(nullptr, sigs.SpiderGameORS, hooked_OnRunState, (void**)&orig_OnRunState);
+	} else if (wcsstr(pwszValueName, L"-Solitaire-")) {
+		initStateTimekeeping();
+		g_LastORSRet = 6;
+		MakeHook(nullptr, sigs.SolitaireGameORS, hooked_OnRunState, (void**)&orig_OnRunState);
 	}
 
 	return S_OK;

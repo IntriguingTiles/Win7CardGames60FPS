@@ -130,7 +130,10 @@
       <LinkTimeCodeGeneration>Default</LinkTimeCodeGeneration>
     </Link>
     <PostBuildEvent>
-      <Command>copy /y $(TargetPath) "C:\Program Files\Microsoft Games\Solitaire\slc.dll"</Command>
+      <Command>copy /y $(TargetPath) "C:\Program Files\Microsoft Games\Solitaire\slc.dll"
+copy /y $(TargetPath) "C:\Program Files\Microsoft Games\SpiderSolitaire\slc.dll"
+copy /y $(TargetPath) "C:\Program Files\Microsoft Games\Hearts\slc.dll"
+copy /y $(TargetPath) "C:\Program Files\Microsoft Games\FreeCell\slc.dll"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
